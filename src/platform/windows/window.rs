@@ -1,4 +1,4 @@
-use std::{ffi::CString, os::raw::c_void};
+use std::ffi::CString;
 use windows::{
     core::*,
     Win32::{
@@ -17,15 +17,24 @@ use windows::{
     },
 };
 
-use crate::context::opengl;
+use crate::context::context_impl;
+
+#[derive(Debug)]
+struct WindowData {
+    destroyed: bool,
+}
+
+#[cfg(feature = "opengl")]
+#[derive(Debug)]
 pub struct Window {
     window_handle: HWND,
     dc: HDC,
     context: HGLRC,
+    window_data: Box<WindowData>,
 }
 
 impl Window {
-    pub fn new() -> Window {
+    fn new_opengl_window() -> Window {
         fn choose_pixel_format(dc: HDC, pfd: &mut PIXELFORMATDESCRIPTOR) -> i32 {
             *pfd = PIXELFORMATDESCRIPTOR {
                 nSize: std::mem::size_of::<PIXELFORMATDESCRIPTOR>() as u16,
@@ -41,20 +50,22 @@ impl Window {
             unsafe { ChoosePixelFormat(dc, pfd) }
         }
 
-        let temporary_window = Window::create_window_and_context(
+        let _temporary_window = Window::create_window_and_context(
             w!("Temporary window class"),
             w!("Temporary window"),
             choose_pixel_format,
+            Some(Window::temp_wndproc),
         );
 
-        Window::load_opengl_funcs();
+        context_impl::load_context();
 
         fn choose_pixel_format_ogl46(dc: HDC, pfd: &mut PIXELFORMATDESCRIPTOR) -> i32 {
-            let wglChoosePixelFormatStr = CString::new("wglChoosePixelFormatARB").unwrap();
-            let proc =
-                unsafe { wglGetProcAddress(PCSTR(wglChoosePixelFormatStr.as_ptr() as *const u8)) }
-                    .unwrap();
-            let wglChoosePixelFormatARB = unsafe {
+            let wgl_choose_pixel_format_str = CString::new("wglChoosePixelFormatARB").unwrap();
+            let proc = unsafe {
+                wglGetProcAddress(PCSTR(wgl_choose_pixel_format_str.as_ptr() as *const u8))
+            }
+            .unwrap();
+            let wgl_choose_pixel_format_arb = unsafe {
                 std::mem::transmute::<
                     unsafe extern "system" fn() -> isize,
                     fn(HDC, *const i32, *const f32, u32, *mut i32, *mut u32) -> BOOL,
@@ -63,33 +74,33 @@ impl Window {
 
             let mut pixel_fmt: i32 = 0;
             let mut num_pixel_fmt: u32 = 0;
-            static pixel_attribs: [i32; 21] = [
-                opengl::WGL_SUPPORT_OPENGL_ARB,
+            static PIXEL_ATTRIBS: [i32; 21] = [
+                context_impl::WGL_SUPPORT_OPENGL_ARB,
                 GL_TRUE as i32,
-                opengl::WGL_ACCELERATION_ARB,
-                opengl::WGL_FULL_ACCELERATION_ARB,
-                opengl::WGL_DRAW_TO_WINDOW_ARB,
+                context_impl::WGL_ACCELERATION_ARB,
+                context_impl::WGL_FULL_ACCELERATION_ARB,
+                context_impl::WGL_DRAW_TO_WINDOW_ARB,
                 GL_TRUE as i32,
-                opengl::WGL_DOUBLE_BUFFER_ARB,
+                context_impl::WGL_DOUBLE_BUFFER_ARB,
                 GL_TRUE as i32,
-                opengl::WGL_PIXEL_TYPE_ARB,
-                opengl::WGL_TYPE_RGBA_ARB,
-                opengl::WGL_COLOR_BITS_ARB,
+                context_impl::WGL_PIXEL_TYPE_ARB,
+                context_impl::WGL_TYPE_RGBA_ARB,
+                context_impl::WGL_COLOR_BITS_ARB,
                 24,
-                opengl::WGL_DEPTH_BITS_ARB,
+                context_impl::WGL_DEPTH_BITS_ARB,
                 24,
-                opengl::WGL_STENCIL_BITS_ARB,
+                context_impl::WGL_STENCIL_BITS_ARB,
                 8,
-                opengl::WGL_SAMPLE_BUFFERS_ARB,
+                context_impl::WGL_SAMPLE_BUFFERS_ARB,
                 GL_TRUE as i32,
-                opengl::WGL_SAMPLES_ARB,
+                context_impl::WGL_SAMPLES_ARB,
                 4,
                 0,
             ];
 
-            debug_assert!(wglChoosePixelFormatARB(
+            debug_assert!(wgl_choose_pixel_format_arb(
                 dc,
-                pixel_attribs.as_ptr(),
+                PIXEL_ATTRIBS.as_ptr(),
                 std::ptr::null(),
                 1,
                 &mut pixel_fmt,
@@ -113,7 +124,21 @@ impl Window {
             w!("Renderer window class"),
             w!("Rendered window"),
             choose_pixel_format_ogl46,
+            Some(Window::wndproc),
         );
+
+        unsafe { ShowWindow(window.window_handle, SW_SHOW) };
+
+        window
+    }
+
+    pub fn new() -> Window {
+        #[cfg(feature = "opengl")]
+        let window = Window::new_opengl_window();
+
+        #[cfg(not(feature = "opengl"))]
+        panic!("Unsupported feature !");
+
         window
     }
 
@@ -121,11 +146,13 @@ impl Window {
         window_class: &HSTRING,
         window_name: &HSTRING,
         get_pixel_fmt: fn(HDC, pfd: &mut PIXELFORMATDESCRIPTOR) -> i32,
+        wnd_proc: WNDPROC,
     ) -> Window {
         let instance = Window::get_instance();
 
-        let window_handle = Window::create_window(instance, window_class, window_name);
-        unsafe { ShowWindow(window_handle, SW_SHOW) };
+        let window_data = Box::new(WindowData { destroyed: false });
+        let window_handle =
+            Window::create_window(instance, window_class, window_name, wnd_proc, &window_data);
 
         let dc = unsafe { GetDC(window_handle) };
 
@@ -137,6 +164,7 @@ impl Window {
             window_handle: window_handle,
             dc: dc,
             context: context,
+            window_data: window_data,
         }
     }
 
@@ -160,14 +188,20 @@ impl Window {
         instance
     }
 
-    fn create_window(instance: HINSTANCE, window_class: &HSTRING, window_name: &HSTRING) -> HWND {
+    fn create_window(
+        instance: HINSTANCE,
+        window_class: &HSTRING,
+        window_name: &HSTRING,
+        wnd_proc: WNDPROC,
+        window_data: &Box<WindowData>,
+    ) -> HWND {
         let wc = WNDCLASSEXW {
             hCursor: unsafe { LoadCursorW(None, IDC_ARROW).unwrap() },
             hInstance: instance,
             lpszClassName: window_class.into(),
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
             style: CS_HREDRAW | CS_VREDRAW | CS_OWNDC | CS_DBLCLKS,
-            lpfnWndProc: Some(Window::temp_wndproc),
+            lpfnWndProc: wnd_proc,
             ..Default::default()
         };
 
@@ -177,7 +211,7 @@ impl Window {
                 WINDOW_EX_STYLE::default(),
                 window_class,
                 window_name,
-                WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                WS_OVERLAPPEDWINDOW,
                 CW_USEDEFAULT,
                 CW_USEDEFAULT,
                 CW_USEDEFAULT,
@@ -185,31 +219,9 @@ impl Window {
                 None,
                 None,
                 instance,
-                std::ptr::null(),
+                (&**window_data as *const WindowData).cast(),
             )
         }
-    }
-
-    fn load_opengl_funcs() {
-        let open_gl_handle = unsafe { GetModuleHandleA(s!("opengl32.dll")).unwrap() };
-
-        gl::load_with(|s| {
-            // Here we receive glGetnColorTable
-            let proc_name = CString::new(s).unwrap();
-            match unsafe { GetProcAddress(open_gl_handle, PCSTR(proc_name.as_ptr() as *const u8)) }
-            {
-                Some(func) => func as *const c_void,
-                None => {
-                    match unsafe { wglGetProcAddress(PCSTR(proc_name.as_ptr() as *const u8)) } {
-                        Some(func) => func as *const c_void,
-                        None => {
-                            println!("Could not load func : {:?}!", proc_name);
-                            std::ptr::null()
-                        }
-                    }
-                }
-            }
-        });
     }
 
     fn set_pixel_format(dc: HDC, get_pixel_fmt: fn(HDC, &mut PIXELFORMATDESCRIPTOR) -> i32) {
@@ -227,12 +239,62 @@ impl Window {
         }
         context
     }
+
+    pub fn run(&self) {
+        let mut msg = MSG::default();
+        while unsafe { GetMessageW(&mut msg, HWND::default(), 0, 0) }.as_bool() {
+            unsafe {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+    }
+
+    unsafe extern "system" fn wndproc(
+        window: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        match message as u32 {
+            WM_PAINT => LRESULT(0),
+            WM_CLOSE => {
+                debug_assert!(unsafe { DestroyWindow(window) }.as_bool());
+                LRESULT(0)
+            }
+            WM_DESTROY => {
+                println!("WM_DESTROY");
+                let window_data = GetWindowLongPtrW(window, GWLP_USERDATA) as *mut WindowData;
+                (*window_data).destroyed = true;
+                PostQuitMessage(0);
+                LRESULT(0)
+            }
+            WM_NCCREATE => {
+                println!("NC Create");
+                let createstruct: *mut CREATESTRUCTW = lparam.0 as *mut CREATESTRUCTW;
+                if createstruct.is_null() {
+                    return LRESULT(0);
+                }
+                let window_data = (*createstruct).lpCreateParams;
+                SetWindowLongPtrW(window, GWLP_USERDATA, window_data as isize);
+                //DefWindowProcW(window, message, wparam, lparam)
+                return LRESULT(1);
+            }
+            WM_CREATE => {
+                println!("Create !");
+                LRESULT(0)
+            }
+            _ => DefWindowProcW(window, message, wparam, lparam),
+        }
+    }
 }
 
 impl Drop for Window {
     fn drop(&mut self) {
         debug_assert!(unsafe { wglDeleteContext(self.context) }.as_bool());
-        debug_assert!(unsafe { ReleaseDC(self.window_handle, self.dc) } != 0);
-        debug_assert!(unsafe { DestroyWindow(self.window_handle) }.as_bool());
+        if !self.window_data.destroyed {
+            debug_assert!(unsafe { ReleaseDC(self.window_handle, self.dc) } != 0);
+            debug_assert!(unsafe { DestroyWindow(self.window_handle) }.as_bool());
+        }
     }
 }

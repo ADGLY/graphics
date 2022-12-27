@@ -43,3 +43,30 @@ pub static WGL_FULL_ACCELERATION_ARB: i32 = 0x2027;
 pub static WGL_TYPE_RGBA_ARB: i32 = 0x202B;
 pub static WGL_SAMPLE_BUFFERS_ARB: i32 = 0x2041;
 pub static WGL_SAMPLES_ARB: i32 = 0x2042;
+
+use std::{ffi::CString, os::raw::c_void};
+
+use windows::{
+    core::*,
+    Win32::{Graphics::OpenGL::wglGetProcAddress, System::LibraryLoader::*},
+};
+
+#[cfg(target_os = "windows")]
+pub fn load_context() {
+    let open_gl_handle = unsafe { GetModuleHandleA(s!("opengl32.dll")).unwrap() };
+
+    gl::load_with(|s| {
+        // Here we receive glGetnColorTable
+        let proc_name = CString::new(s).unwrap();
+        match unsafe { GetProcAddress(open_gl_handle, PCSTR(proc_name.as_ptr() as *const u8)) } {
+            Some(func) => func as *const c_void,
+            None => match unsafe { wglGetProcAddress(PCSTR(proc_name.as_ptr() as *const u8)) } {
+                Some(func) => func as *const c_void,
+                None => {
+                    println!("Could not load func : {:?}!", proc_name);
+                    std::ptr::null()
+                }
+            },
+        }
+    });
+}

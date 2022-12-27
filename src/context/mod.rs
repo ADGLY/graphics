@@ -1,2 +1,3 @@
 #[cfg(feature = "opengl")]
-pub mod opengl;
+#[path = "opengl/mod.rs"]
+pub mod context_impl;

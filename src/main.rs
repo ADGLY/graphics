@@ -5,5 +5,5 @@ pub mod window;
 use window::*;
 
 fn main() {
-    let test = unsafe { Window::new() };
+    let _test = unsafe { Window::new() };
 }
