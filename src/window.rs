@@ -1,13 +1,13 @@
-use crate::platform;
+use crate::platform::{self, WindowImpl};
 
-pub struct Window {
-    window: platform::window::Window,
+pub struct Window<T: WindowImpl> {
+    window: T,
     created: bool,
 }
 
-impl Window {
+impl<T: WindowImpl> Window<T> {
     pub fn new() {
-        let test_window = platform::window::Window::new();
+        let test_window = T::create();
         test_window.run();
         println!("End !");
     }
